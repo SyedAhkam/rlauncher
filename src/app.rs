@@ -1,4 +1,5 @@
 use wasm_bindgen::prelude::*;
+use web_sys::{HtmlInputElement};
 use yew::prelude::*;
 
 #[wasm_bindgen]
@@ -10,18 +11,53 @@ extern "C" {
     fn log(s: &str);
 }
 
-#[function_component(App)]
-pub fn app() -> Html {
+pub enum Msg {
+    QueryChange(String),
+}
 
-    html! {
-        <main class="container">
-            <h1>{ "Hello, world!" }</h1>
-            <p>{ "This is a simple example of a Tauri app with Yew." }</p>
-            <p>{ "Learn more about Tauri at " }<a href="https://tauri.studio">{ "https://tauri.studio" }</a></p>
-            <p>{ "Learn more about Yew at " }<a href="https://yew.rs">{ "https://yew.rs" }</a></p>
-            <p>{ "Learn more about Tauri commands at " }<a href="https://tauri.studio/en/docs/usage/guides/commands">{ "https://tauri.studio/en/docs/usage/guides/commands" }</a></p>
-            <p>{ "Learn more about Tauri API at " }<a href="https://tauri.studio/en/docs/api/js">{ "https://tauri.studio/en/docs/api/js" }</a></p>
-            <p>{ "Learn more about Yew API at " }<a href="https://docs.rs/yew">{ "https://docs.rs/yew" }</a></p>
-        </main>
+pub struct App {
+    query: String,
+}
+
+impl Component for App {
+    type Message = Msg;
+    type Properties = ();
+
+    fn create(_ctx: &Context<Self>) -> Self {
+        Self {
+            query: String::default(),
+        }
+    }
+
+    fn update(&mut self, _ctx: &Context<Self>, msg: Self::Message) -> bool {
+        match msg {
+            Msg::QueryChange(query) => {
+                if query != self.query {
+                    self.query = query;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn view(&self, ctx: &Context<Self>) -> Html {
+        html! {
+            <main class="container bg-emerald-800 px-4 py-4 rounded-lg flex flex-col justify-items-stretch">
+                <div class="query">
+                    <input 
+                        type="text" 
+                        class="bg-emerald-900 text-white rounded-lg w-full text-[36px]" 
+                        oninput={ctx.link().callback(|e: InputEvent| {
+                            let input: HtmlInputElement = e.target_unchecked_into();
+                            Msg::QueryChange(input.value())
+                        })}
+                        value={self.query.clone()} 
+                    />
+                    <p>{self.query.clone()}</p>
+                </div>
+            </main>
+        }
     }
 }
