@@ -3,8 +3,9 @@
     windows_subsystem = "windows"
 )]
 
-use std::path::{PathBuf, Path};
+use std::{path::{PathBuf, Path}, sync::Arc};
 
+use sqlx::Row;
 use tauri::{
     CustomMenuItem, GlobalShortcutManager, Manager, PhysicalSize, Size, SystemTray,
     SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem, WindowEvent,
@@ -12,6 +13,8 @@ use tauri::{
 use xdg::BaseDirectories;
 use log::*;
 use lazy_static::lazy_static;
+use gtk::prelude::GtkWindowExt;
+use anyhow::Result;
 
 const CACHE_DIR: &str = "rlauncher-cache";
 const APPLICATIONS_DIR: &str = "/usr/share/applications";
@@ -20,40 +23,130 @@ lazy_static! {
     static ref XDG_DIRS: BaseDirectories = BaseDirectories::with_prefix(CACHE_DIR).unwrap();
 }
 
+struct Application {
+    name: String,
+    exec: String,
+    comment: Option<String>,
+    categories: Option<String>,
+    keywords: Option<String>,
+    use_terminal: bool
+}
+
+impl Application {
+    fn from_desktop(path: &Path) -> Result<Self> {
+        let desktop_file = freedesktop_entry_parser::parse_entry(path).unwrap();
+
+        let desktop_entry_section = desktop_file.section("Desktop Entry");
+        
+        let exec = desktop_entry_section.attr("Exec");
+        if !exec.is_some() {
+            warn!("No Exec field in {}", path.display());
+            
+            return Err(anyhow::anyhow!("No Exec field in {}", path.display()));
+        }
+
+        Ok(Self {
+            name: desktop_entry_section.attr("Name").unwrap().to_string(),
+            exec: exec.unwrap().to_string(),
+            comment: desktop_entry_section.attr("Comment").map(|s| s.to_string()),
+            categories: desktop_entry_section.attr("Categories").map(|s| s.to_string()),
+            keywords: desktop_entry_section.attr("Keywords").map(|s| s.to_string()),
+            use_terminal: desktop_entry_section.attr("Terminal").unwrap_or("false") == "true"
+        })
+    }
+}
+
 #[derive(Debug)]
 struct CacheManager {
     cache_dir: PathBuf,
+    application_db: sqlx::SqlitePool,
 }
 
 impl CacheManager {
-    fn new() -> Self {
+    async fn new() -> Self {
         let cache_dir = (*XDG_DIRS).get_cache_home();
 
         // Make sure the cache directory exists
         if !std::path::Path::new(&cache_dir).exists() {
             std::fs::create_dir_all(&cache_dir).unwrap();
-            warn!("Created cache directory at {}", cache_dir.display());
+            info!("Created cache directory at {}", cache_dir.display());
         }
+
+        // Make sure the applications database exists
+        let application_db_path = cache_dir.join("applications.db");
+        if !application_db_path.exists() {
+            std::fs::File::create(&application_db_path).unwrap();
+            info!("Created applications database at {}", application_db_path.display());
+        }
+
+        // Connect to the applications database
+        let application_db = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            application_db_path.display()
+        )).await.unwrap();
 
         Self {
-            cache_dir
+            cache_dir,
+            application_db,
         }
     }
 
-    fn add_if_not_exists(&self, desktop_entry: freedesktop_entry_parser::Entry) {
-        // Get the desktop entry section
-        let desktop_entry_section = desktop_entry.section("Desktop Entry");
-
-        // Get the name of application
-        let name = desktop_entry_section.attr("Name").unwrap();
+    // TODO
+    async fn does_exist_by_name(&self, db: &sqlx::SqlitePool, name: &str) -> bool {
+        // let rows = sqlx::query("SELECT COUNT(*) FROM applications WHERE name = ?")
+        //     .bind(name)
+        //     .fetch_one(db)
+        //     .await
+        //     .unwrap();
         
+        // rows.get::<usize, i64>(0) > 0
 
-        println!("Desktop file: {:#?}", name);
+        false
     }
 
-    fn rebuild_cache(&self) {
+    async fn add_application(&self, application: Application) {
+        match sqlx::query(
+            "INSERT INTO applications (name, exec, comment, categories, keywords, use_terminal) VALUES (?, ?, ?, ?, ?, ?)"
+        )
+            .bind(&application.name)
+            .bind(&application.exec)
+            .bind(&application.comment)
+            .bind(&application.categories)
+            .bind(&application.keywords)
+            .bind(application.use_terminal)
+            .execute(&self.application_db)
+            .await {
+                Ok(_) => info!("Added application {} to database", application.name),
+                Err(e) => error!("Failed to add application {} to database: {}", application.name, e)
+            }
+    }
+
+    async fn add_if_not_exists(&self, application: Application) {
+        if self.does_exist_by_name(&self.application_db, &application.name).await { return }
+
+        println!("Adding application {}", application.name);
+        self.add_application(application).await;
+    }
+
+    async fn ensure_tables_exist(&self) {
+        sqlx::query("CREATE TABLE IF NOT EXISTS applications (
+            name TEXT NOT NULL PRIMARY KEY,
+            exec TEXT NOT NULL,
+            comment TEXT,
+            categories TEXT,
+            keywords TEXT,
+            use_terminal BOOLEAN NOT NULL,
+            UNIQUE (name)
+        )").execute(&self.application_db).await.unwrap();
+    }
+
+    async fn rebuild_cache(&self) -> Result<()> {
         println!("Cache dir: {}", self.cache_dir.display());
 
+        // Make sure all the necessary database tables exist
+        self.ensure_tables_exist().await;
+
+        // Get all the desktop files in the applications directory
         for entry in std::fs::read_dir(APPLICATIONS_DIR).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -61,19 +154,25 @@ impl CacheManager {
             if !path.is_file() { continue };
             if !path.extension().unwrap().eq("desktop") { continue };
 
-            let desktop_file = freedesktop_entry_parser::parse_entry(&path).expect("Failed to parse desktop file");
-
-            self.add_if_not_exists(desktop_file);
+            
+            if let Ok(application) = Application::from_desktop(&path) {
+                self.add_if_not_exists(application).await;
+            };
         }
+
+        Ok(())
     }
 }
 
 #[tauri::command]
-fn rebuild_cache(cache_manager: tauri::State<CacheManager>) {
-    cache_manager.rebuild_cache();
+async fn rebuild_cache(cache_manager: tauri::State<'_, CacheManager>) -> Result<(), ()> {
+    cache_manager.rebuild_cache().await.unwrap();
+
+    Ok(())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<()> {
     let sys_tray = SystemTray::new().with_menu(
         SystemTrayMenu::new()
             .add_item(CustomMenuItem::new("focus", "Focus"))
@@ -84,6 +183,11 @@ fn main() {
 
     tauri::Builder::default()
         .setup(|app| {
+            // Setup logging
+            simple_logger::SimpleLogger::new()
+                .init()
+                .unwrap();
+
             let window = app.get_window("main").unwrap();
 
             // Set window size
@@ -96,6 +200,9 @@ fn main() {
 
             // Center window
             window.center().unwrap();
+
+            // Stick the window in all workspaces
+            window.gtk_window()?.stick();
 
             // Register global keyboard shortcuts
             app.global_shortcut_manager()
@@ -123,17 +230,20 @@ fn main() {
                     app.exit(0);
                 },
                 "rebuild-cache" => {
-                    app.state::<CacheManager>().rebuild_cache();
+                    let app_cloned = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        app_cloned.state::<CacheManager>().rebuild_cache().await.unwrap();
+                    });
                 }
                 _ => {}
             },
             _ => {}
         })
         .on_window_event(|event| match event.event() {
-            // WindowEvent::Focused(false) => {
-            //     // Hide the window when it loses focus
-            //     event.window().hide().unwrap();
-            // },
+            WindowEvent::Focused(false) => {
+                // Hide the window when it loses focus
+                event.window().hide().unwrap();
+            },
             WindowEvent::Focused(true) => {
                 // Make sure the window is centered after regaining focus
                 event.window().center().unwrap();
@@ -141,7 +251,9 @@ fn main() {
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![rebuild_cache])
-        .manage(CacheManager::new())
+        .manage(CacheManager::new().await)
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+
+        Ok(())
 }
